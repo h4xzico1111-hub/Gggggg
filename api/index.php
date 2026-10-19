@@ -1,10 +1,26 @@
 <?php
-/* ========= CLOUDFLARE WORKER PROXY SETUP ========= */
-$proxyBase = 'https://proxy.xoje.workers.dev/?url=';
+/* =======================================================
+   UNIVERSAL RUMBLE EXTRACTOR (Bulletproof Version)
+   Works on Vercel, InfinityFree, and Localhost
+   ======================================================= */
+
+// यहाँ अपना Cloudflare Worker URL डालें (अगर है तो)
+$workerUrl = 'https://proxy.xoje.workers.dev/?url='; 
 
 error_reporting(E_ALL);
 ini_set('display_errors', '1');
 ini_set('memory_limit', '128M');
+@set_time_limit(60); // Timeout से बचने के लिए
+
+// White page error handling
+register_shutdown_function(function () {
+    $e = error_get_last();
+    if ($e && in_array($e['type'], array(E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR))) {
+        echo '<div style="background:#fee;color:#900;padding:15px;border-radius:10px;margin:10px;font-family:monospace;">';
+        echo '<b>Fatal Error:</b> ' . htmlspecialchars($e['message']);
+        echo '</div>';
+    }
+});
 
 $url = '';
 if (isset($_POST['url'])) {
@@ -17,67 +33,94 @@ $videoId = '';
 $videos = array();
 $steps = array();
 $meta = array();
-$sourceUsed = '';
 $success = false;
 
 function h($v) { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
 
-function curlGet($target, $timeout = 15, $useProxy = true) {
-    global $proxyBase;
-    
-    if ($useProxy && $proxyBase !== '') {
-        $target = $proxyBase . urlencode($target);
-    }
-
-    $ch = curl_init($target);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-    curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
-    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
-    curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
-    curl_setopt($ch, CURLOPT_ENCODING, '');
-    
-    curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+/* ==========================================
+   UNIVERSAL HTTP GET FUNCTION
+   (cURL + fopen Fallback + open_basedir Safe)
+   ========================================== */
+function httpGet($target, $timeout = 10) {
+    $headers = array(
         'Accept: application/json, text/plain, */*',
         'Accept-Language: en-US,en;q=0.9',
+        'Referer: https://rumble.com/',
+        'Origin: https://rumble.com',
         'DNT: 1',
-    ));
-    curl_setopt($ch, CURLOPT_USERAGENT,
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    $body = curl_exec($ch);
-    $info = array(
-        'status' => (int)curl_getinfo($ch, CURLINFO_HTTP_CODE),
-        'errno'  => curl_errno($ch),
-        'errmsg' => curl_error($ch),
-        'size'   => is_string($body) ? strlen($body) : 0,
     );
-    curl_close($ch);
+    $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    
+    $body = false;
+    $info = array('status'=>0, 'errno'=>-1, 'errmsg'=>'no transport', 'size'=>0, 'via'=>'none');
+
+    // 1. Try cURL
+    if (function_exists('curl_init')) {
+        $ch = curl_init($target);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        // open_basedir fix
+        if (empty(ini_get('open_basedir'))) {   
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
+        }
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+        curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($ch, CURLOPT_USERAGENT, $ua);
+        // CURL_HTTP_VERSION_2_0 removed for compatibility
+        $body = curl_exec($ch);
+        $info = array(
+            'status' => (int)curl_getinfo($ch, CURLINFO_HTTP_CODE),
+            'errno'  => curl_errno($ch),
+            'errmsg' => curl_error($ch),
+            'size'   => is_string($body) ? strlen($body) : 0,
+            'via'    => 'curl',
+        );
+        curl_close($ch);
+        if ($info['errno'] === 0 && is_string($body) && $info['status'] > 0) return array($body, $info);
+    }
+
+    // 2. Try file_get_contents fallback
+    if (ini_get('allow_url_fopen')) {
+        $ctx = stream_context_create(array(
+            'http' => array(
+                'method'          => 'GET',
+                'timeout'         => $timeout,
+                'user_agent'      => $ua,
+                'header'          => implode("\r\n", $headers) . "\r\n",
+                'follow_location' => 1,
+                'max_redirects'   => 3,
+                'ignore_errors'   => true,
+            ),
+            'ssl' => array('verify_peer' => false, 'verify_peer_name' => false),
+        ));
+        $body = @file_get_contents($target, false, $ctx);
+        $status = 0;
+        if (isset($http_response_header) && is_array($http_response_header)) {
+            foreach ($http_response_header as $hdr) {
+                if (preg_match('#^HTTP/\S+\s+(\d+)#', $hdr, $m)) $status = (int)$m[1];
+            }
+        }
+        if (is_string($body)) {
+            return array($body, array(
+                'status' => $status, 'errno' => 0, 'errmsg' => '',
+                'size'   => strlen($body), 'via' => 'fopen',
+            ));
+        }
+    }
     return array($body, $info);
 }
 
-/* Cobalt API Fallback (Rumble को ब्लॉक करने से बचाने के लिए) */
-function fetchCobalt($videoUrl) {
-    $ch = curl_init('https://api.cobalt.tools/api/json');
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode(array('url' => $videoUrl)));
-    curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-        'Accept: application/json',
-        'Content-Type: application/json'
-    ));
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-    $response = curl_exec($ch);
-    curl_close($ch);
-    return json_decode($response, true);
-}
-
+/* ==========================================
+   JSON PARSER
+   ========================================== */
 function parseEmbedJson($body, &$videos) {
     $data = json_decode((string)$body, true);
     if (!is_array($data) || empty($data['ua']) || !is_array($data['ua'])) return false;
     $ua = $data['ua'];
+    
     if (isset($ua['hls']) && is_array($ua['hls'])) {
         foreach ($ua['hls'] as $q => $item) {
             if (is_array($item) && !empty($item['url']))
@@ -100,62 +143,102 @@ function parseEmbedJson($body, &$videos) {
     return count($videos) > 0;
 }
 
-/* ============ MAIN EXTRACTOR ============ */
-if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+/* ==========================================
+   HTML SCRAPER (Fallback)
+   ========================================== */
+function parseHtmlForUrls($body, &$videos) {
+    if (!is_string($body) || strlen($body) < 50) return false;
+    $found = false;
+    if (preg_match_all('#https?://[^\s"\'<>\\\\]+\.(?:mp4|m3u8)[^\s"\'<>\\\\]*#i', $body, $mm)) {
+        $uniq = array_unique($mm[0]);
+        $i = 0;
+        foreach ($uniq as $u) {
+            if (stripos($u, '.m3u8') !== false) {
+                $videos['HLS / m3u8 (' . (++$i) . ')'] = $u;
+                $found = true;
+            } elseif (preg_match('#/([a-z]{3})\.mp4#i', $u, $qm)) {
+                $label = 'MP4 (' . $qm[1] . ')';
+                $videos[$label] = $u;
+                $found = true;
+            }
+        }
+    }
+    return $found;
+}
 
-    /* STEP 1: URL से Video ID निकालें */
+/* ==========================================
+   MAIN EXTRACTOR
+   ========================================== */
+if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    
+    $startTime = microtime(true);
+    $timeBudget = 40; // Vercel/InfinityFree Timeout से बचने के लिए
+
+    // 1. Extract ID from URL directly
     if (preg_match('#rumble\.com/(v[a-zA-Z0-9]+)#i', $url, $m)) {
         $videoId = $m[1];
         $steps[] = '✓ Video ID (from URL): ' . $videoId;
+    } else {
+        // 2. Try oEmbed if ID not in URL
+        $oembedUrl = 'https://rumble.com/api/Media/oembed.json?url=' . urlencode($url);
+        list($oBody, $oInfo) = httpGet($oembedUrl, 8);
+        if ($oInfo['status'] === 200 && preg_match('#rumble\.com/embed/([a-zA-Z0-9]+)#', $oBody, $m)) {
+            $videoId = $m[1];
+            $steps[] = '✓ Video ID (from oEmbed): ' . $videoId;
+        }
     }
 
-    /* STEP 2: Rumble API (Worker के जरिए) */
     if ($videoId !== '') {
         $encId = urlencode($videoId);
         $rawApi = 'https://rumble.com/embedJS/u3/?ifr=0&dref=&request=video&ver=2&v=' . $encId . '&ad_wt=0';
 
-        $sources = array(
-            'embedJS (via Worker)' => array('type' => 'json', 'url' => $rawApi, 'proxy' => true),
+        // 3. Define all possible routes (Direct, Worker, and 4 Public Proxies)
+        $routes = array(
+            'Direct API' => $rawApi,
+            'Cloudflare Worker' => $workerUrl . urlencode($rawApi),
+            'Proxy 1 (corsproxy)' => 'https://corsproxy.io/?' . urlencode($rawApi),
+            'Proxy 2 (allorigins)' => 'https://api.allorigins.win/raw?url=' . urlencode($rawApi),
+            'Proxy 3 (cors.eu)' => 'https://cors.eu.org/' . $rawApi,
+            'Proxy 4 (codetabs)' => 'https://api.codetabs.com/v1/proxy?quest=' . urlencode($rawApi),
         );
 
-        foreach ($sources as $name => $src) {
-            $useProxy = isset($src['proxy']) ? $src['proxy'] : true;
-            list($body, $info) = curlGet($src['url'], 10, $useProxy);
-            
-            $steps[] = $name . ' · HTTP ' . $info['status'] . ' · ' . $info['size'] . ' bytes';
+        foreach ($routes as $name => $fetchUrl) {
+            if (microtime(true) - $startTime > $timeBudget) {
+                $steps[] = '⏱ Time budget exceeded — रुका: ' . $name;
+                break;
+            }
 
+            list($body, $info) = httpGet($fetchUrl, 10);
+            $blocked = is_string($body) && (stripos($body, 'Just a moment') !== false || stripos($body, 'cf-browser-verification') !== false);
+            
+            $steps[] = $name . ' · HTTP ' . $info['status'] . ' · ' . $info['size'] . ' bytes' . ($blocked ? ' · BLOCKED' : '');
+
+            // अगर 200 OK है और ब्लॉक नहीं है
             if ($info['status'] === 200 && !$blocked) {
                 if (parseEmbedJson($body, $videos) && count($videos) > 0) {
                     $success = true;
                     $steps[] = '✓ Success: ' . $name;
                     break;
                 }
-            } else {
-                $steps[] = '✗ Blocked/Failed by Rumble';
+            }
+            unset($body);
+        }
+
+        // 4. Last Resort: HTML Scrape via Proxy (if JSON API completely fails)
+        if (!$success) {
+            $steps[] = 'Trying HTML Scrape...';
+            list($body, $info) = httpGet($workerUrl . urlencode($url), 10);
+            if ($info['status'] === 200 && parseHtmlForUrls($body, $videos)) {
+                $success = true;
+                $steps[] = '✓ Success: HTML Scrape';
             }
         }
-    }
 
-    /* STEP 3: Cobalt API Fallback (अगर Rumble का API काम न करे) */
-    if (!$success) {
-        $steps[] = 'Trying fallback: Cobalt API...';
-        $cobalt = fetchCobalt($url);
-        
-        if (isset($cobalt['status']) && $cobalt['status'] === 'stream' && !empty($cobalt['url'])) {
-            $videos['MP4 (Direct via Cobalt)'] = $cobalt['url'];
-            $success = true;
-            $steps[] = '✓ Success: Cobalt API';
-        } elseif (isset($cobalt['status']) && $cobalt['status'] === 'redirect' && !empty($cobalt['url'])) {
-            $videos['MP4 (Direct via Cobalt)'] = $cobalt['url'];
-            $success = true;
-            $steps[] = '✓ Success: Cobalt API (redirect)';
-        } else {
-            $steps[] = '✗ Cobalt API failed or rate-limited.';
+        if (!$success) {
+            $error = 'वीडियो लिंक नहीं मिले। सभी सर्वर ब्लॉक हो गए हैं। कृपया बाद में फिर कोशिश करें।';
         }
-    }
-
-    if (!$success) {
-        $error = 'वीडियो लिंक नहीं मिले। Rumble ने सभी रास्ते ब्लॉक कर दिए हैं।';
+    } else {
+        $error = 'Video ID नहीं मिला। कृपया सही Rumble लिंक डालें।';
     }
 }
 ?>
@@ -227,6 +310,7 @@ summary::-webkit-details-marker{display:none}
 </head>
 <body>
 <div class="wrap">
+
 <div class="card">
     <h1>🎬 Rumble Video Extractor</h1>
     <div class="sub">वीडियो लिंक डालें और स्ट्रीम URLs पाएँ</div>
@@ -248,6 +332,7 @@ summary::-webkit-details-marker{display:none}
         <span style="font-size:13px;margin-top:8px;display:block"><?php echo h($meta['title']); ?></span>
         <?php endif; ?>
     </div>
+
     <?php if (count($videos) > 0): ?>
     <h3>🎯 Stream URLs</h3>
     <?php foreach ($videos as $label => $vurl): ?>
@@ -267,13 +352,14 @@ summary::-webkit-details-marker{display:none}
 <?php if (count($steps) > 0): ?>
 <div class="card">
     <details>
-        <summary>🛠️ Request Log</summary>
+        <summary>🛠️ Request Log (देखें कौन सा रास्ता काम कर रहा है)</summary>
         <?php foreach ($steps as $s): ?>
         <div class="step"><?php echo h($s); ?></div>
         <?php endforeach; ?>
     </details>
 </div>
 <?php endif; ?>
+
 </div>
 <script>
 function cp(btn, t) {
