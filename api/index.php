@@ -1,4 +1,8 @@
 <?php
+/* ========= CLOUDFLARE WORKER PROXY SETUP ========= */
+// यहाँ आपके Worker का लिंक है, जिससे Vercel सीधे कनेक्ट होगा
+$proxyBase = 'https://proxy.xoje.workers.dev/?url=';
+
 error_reporting(E_ALL);
 ini_set('display_errors', '1');
 ini_set('memory_limit', '128M');
@@ -20,6 +24,13 @@ $success = false;
 function h($v) { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
 
 function curlGet($target, $timeout = 25) {
+    global $proxyBase;
+    
+    // अगर प्रॉक्सी सेट है, तो सारी रिक्वेस्ट Worker के जरिए जाएंगी
+    if ($proxyBase !== '') {
+        $target = $proxyBase . urlencode($target);
+    }
+
     $ch = curl_init($target);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
@@ -29,19 +40,10 @@ function curlGet($target, $timeout = 25) {
     curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
     curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
     curl_setopt($ch, CURLOPT_ENCODING, '');
-    // जिस लाइन में एरर आ रहा था, उसे हटा दिया गया है
     
     curl_setopt($ch, CURLOPT_HTTPHEADER, array(
         'Accept: application/json, text/plain, */*',
         'Accept-Language: en-US,en;q=0.9',
-        'Referer: https://rumble.com/',
-        'Origin: https://rumble.com',
-        'Sec-Fetch-Dest: empty',
-        'Sec-Fetch-Mode: cors',
-        'Sec-Fetch-Site: same-origin',
-        'sec-ch-ua: "Chromium";v="120", "Not(A:Brand";v="24"',
-        'sec-ch-ua-mobile: ?0',
-        'sec-ch-ua-platform: "Windows"',
         'DNT: 1',
     ));
     curl_setopt($ch, CURLOPT_USERAGENT,
@@ -126,6 +128,8 @@ if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') 
         if (is_array($oData)) {
             if (!empty($oData['title'])) $meta['title'] = $oData['title'];
         }
+    } else {
+        $steps[] = '✗ oEmbed failed. (Vercel IP blocked by Rumble)';
     }
 
     /* STEP 2: try sources in order */
@@ -133,10 +137,8 @@ if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') 
         $encId = urlencode($videoId);
         $rawApi = 'https://rumble.com/embedJS/u3/?ifr=0&dref=&request=video&ver=2&v=' . $encId . '&ad_wt=0';
 
-        // पुराने डेड प्रॉक्सी हटा दिए गए हैं, अब सिर्फ डायरेक्ट सोर्सेस रहेंगे जो Vercel पर बहुत तेज़ चलेंगे
         $sources = array(
             'embedJS direct'    => array('type' => 'json', 'url' => $rawApi),
-            'embedJS www'       => array('type' => 'json', 'url' => 'https://www.rumble.com/embedJS/u3/?ifr=0&dref=&request=video&ver=2&v=' . $encId . '&ad_wt=0'),
             'embed page'        => array('type' => 'html', 'url' => 'https://rumble.com/embed/' . $encId . '/'),
             'page full HTML'    => array('type' => 'html', 'url' => $url),
         );
@@ -145,7 +147,7 @@ if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') 
             list($body, $info) = curlGet($src['url'], 25);
             $blocked = is_string($body) && stripos($body, 'Just a moment') !== false;
             $steps[] = $name . ' · HTTP ' . $info['status'] . ' · ' . $info['size'] . ' bytes'
-                     . ($blocked ? ' · blocked' : '');
+                     . ($blocked ? ' · BLOCKED' : '');
 
             if ($info['errno'] !== 0 || $info['status'] !== 200 || $blocked) continue;
 
@@ -171,7 +173,7 @@ if (isset($_SERVER['REQUEST_METHOD']) && $_SERVER['REQUEST_METHOD'] === 'POST') 
             $error = 'वीडियो लिंक नहीं मिले। थोड़ी देर बाद फिर कोशिश करें।';
         }
     } else {
-        $error = 'Video ID नहीं मिला।';
+        $error = 'Video ID नहीं मिला। कृपया Request Log देखें।';
     }
 }
 ?>
